@@ -24,37 +24,42 @@ def get_sheet_connection():
     client = gspread.authorize(creds)
     return client
 
-def create_and_fill_sheet(df, user_email):
+def create_tab_and_fill(df, search_term, sheet_name):
     """
-    Creates a NEW sheet with a timestamp, shares it with the user, 
-    and fills it with data. Returns the URL of the new sheet.
+    Creates a NEW TAB (Worksheet) inside the Master Sheet.
     """
     try:
         client = get_sheet_connection()
+        # Open the Master Sheet (Owned by YOU, so no storage error)
+        sh = client.open(sheet_name)
         
-        # 1. Generate unique filename with timestamp
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        filename = f"Search Results - {timestamp}"
+        # 1. Generate a unique name for the Tab (e.g. "12-02 Python Dev")
+        # Keep it short (limit is 100 chars, but shorter is better for tabs)
+        timestamp = datetime.now().strftime("%m-%d %H:%M")
+        # Clean search term to keep tab name valid
+        short_term = (search_term[:15] + '..') if len(search_term) > 15 else search_term
+        tab_title = f"{timestamp} - {short_term}"
         
-        # 2. Create the new spreadsheet (It lives in the Bot's Drive initially)
-        sh = client.create(filename)
+        # 2. Create the new Worksheet (Tab)
+        # rows=20 is just initial; it expands automatically
+        worksheet = sh.add_worksheet(title=tab_title, rows=20, cols=10)
         
-        # 3. CRITICAL: Share it with the human user so they can see it
-        # We use the email entered in the form
-        sh.share(user_email, perm_type='user', role='writer')
+        # 3. Add Headers & Data
+        worksheet.append_row(['Name', 'Profile Link', 'Snippet'])
         
-        # 4. Write Data
-        worksheet = sh.sheet1
-        # Add Headers first
-        worksheet.append_row(['Name', 'Link', 'Snippet'])
-        # Add Data
-        worksheet.append_rows(df.values.tolist())
+        # Prepare data (df to list)
+        data = df[['Name', 'Link', 'Snippet']].values.tolist()
+        worksheet.append_rows(data)
         
-        return sh.url, filename
+        # 4. Generate Link to this specific TAB
+        # The URL needs the 'gid' (Grid ID) to open the specific tab
+        tab_url = f"{sh.url}#gid={worksheet.id}"
         
+        return True, tab_url, tab_title
+
     except Exception as e:
-        st.error(f"Sheet Creation Error: {e}")
-        return None, None
+        st.error(f"Tab Creation Error: {e}")
+        return False, None, None
 
 def search_google(query, num_results=10):
     service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
@@ -74,9 +79,9 @@ def search_google(query, num_results=10):
         st.error(f"Google Search Error: {e}")
     return results
 
-def send_summary_email(user_email, df, sheet_url):
+def send_summary_email(user_email, df, sheet_url, tab_name):
     msg = MIMEMultipart()
-    msg['Subject'] = f"New Candidates Found ({len(df)})"
+    msg['Subject'] = f"Search Results: {tab_name}"
     msg['From'] = GMAIL_USER
     msg['To'] = user_email
 
@@ -84,13 +89,12 @@ def send_summary_email(user_email, df, sheet_url):
     
     body = f"""
     <h3>Passive Candidate Report</h3>
-    <p>We found {len(df)} profiles.</p>
+    <p>Found {len(df)} candidates.</p>
     
-    <p><strong>📂 Access your new Spreadsheet here:</strong><br>
-    <a href="{sheet_url}">{sheet_url}</a></p>
+    <p><strong>📂 View Results in Tab: '{tab_name}'</strong><br>
+    <a href="{sheet_url}" style="font-size:16px;">Click here to open the specific Tab</a></p>
     
     <hr>
-    <h4>Preview:</h4>
     {html_table}
     """
     msg.attach(MIMEText(body, 'html'))
@@ -108,13 +112,17 @@ def send_summary_email(user_email, df, sheet_url):
 st.title("🕵️ Passive Candidate Hunter")
 
 with st.form("search_form"):
-    st.write("This will create a brand new Google Sheet for every search.")
-    job_keywords = st.text_input("Job Keywords", "Sales Director Chicago")
-    recipient_email = st.text_input("Email Report To (Must be a Google Account)", "your_email@gmail.com")
+    st.info("This will create a NEW TAB in your Master Sheet for every search.")
+    
+    # Inputs
+    job_keywords = st.text_input("Job Keywords", "Python Developer London")
+    recipient_email = st.text_input("Email Report To", "judd@sharphuman.com")
+    master_sheet_name = st.text_input("Master Sheet Name (Must Exist in Drive)", "Candidate Database")
+    
     submitted = st.form_submit_button("Run Search")
 
 if submitted:
-    st.info(f"Searching for: {job_keywords}...")
+    st.write(f"Searching for: **{job_keywords}**...")
     
     # 1. Search
     xray_query = f'site:linkedin.com/in/ {job_keywords}'
@@ -125,21 +133,20 @@ if submitted:
         st.success(f"Found {len(candidates)} profiles!")
         st.dataframe(df)
         
-        # 2. Create & Save to NEW Sheet
-        with st.spinner('Creating new Google Sheet...'):
-            sheet_url, sheet_name = create_and_fill_sheet(df, recipient_email)
+        # 2. Create Tab
+        with st.spinner('Creating new Tab in Sheet...'):
+            success, tab_url, tab_name = create_tab_and_fill(df, job_keywords, master_sheet_name)
             
-            if sheet_url:
-                st.success(f"✅ Created new sheet: '{sheet_name}'")
-                st.markdown(f"[Open Google Sheet]({sheet_url})")
-
-                # 3. Email with Link
+            if success:
+                st.success(f"✅ Created Tab: {tab_name}")
+                
+                # 3. Email
                 with st.spinner('Sending Email...'):
-                    if send_summary_email(recipient_email, df, sheet_url):
+                    if send_summary_email(recipient_email, df, tab_url, tab_name):
                         st.success(f"✅ Email sent to {recipient_email}")
                     else:
                         st.error("❌ Email failed.")
             else:
-                st.error("Could not create sheet. Check permissions.")
+                st.error("Could not write to sheet. Check that 'Candidate Database' exists and is shared with the bot.")
     else:
         st.warning("No results found. Try broader keywords.")
