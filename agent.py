@@ -18,44 +18,43 @@ GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 SHEET_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
+# --- HARDCODED SHEET ID ---
+# We point the bot directly to your specific file
+MASTER_SHEET_ID = "14x4FW2Zsbj9g-j5bGt12l5SsK11fWEf94i0t1HxAnas"
+
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- MEMORY SYSTEM (THE PHONEBOOK) ---
+# --- GOOGLE & SHEET FUNCTIONS ---
 
 def get_gspread_client():
     creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SHEET_SCOPE)
     return gspread.authorize(creds)
 
-def get_user_sheet_id(user_email):
+def save_results(df, role_name):
     """
-    Checks the 'Bot_Memory' sheet to see if we already know this user's DB.
+    Saves directly to the hardcoded MASTER_SHEET_ID
     """
     client = get_gspread_client()
     try:
-        # Opens the Admin's memory file
-        memory = client.open("Bot_Memory").sheet1
-        records = memory.get_all_records()
-        
-        # Look for the user's email in the list
-        for row in records:
-            if row['User'].strip().lower() == user_email.strip().lower():
-                return row['Sheet_Key']
+        sh = client.open_by_key(MASTER_SHEET_ID)
     except Exception as e:
-        print(f"Memory Lookup Error (Check if 'Bot_Memory' exists): {e}")
-        return None
-    return None
+        st.error(f"❌ Permission Error: The bot cannot access your sheet. Did you share it with {st.secrets['SHEET_CREDENTIALS']['client_email']}?")
+        st.stop()
 
-def save_user_memory(user_email, sheet_key):
-    """
-    Saves a new user's sheet key to the memory file.
-    """
-    client = get_gspread_client()
-    try:
-        memory = client.open("Bot_Memory").sheet1
-        memory.append_row([user_email, sheet_key])
-    except Exception as e:
-        st.warning(f"Could not save to memory. Ensure 'Bot_Memory' exists and is shared with the bot. Error: {e}")
+    timestamp = datetime.now().strftime("%m-%d %H:%M")
+    short_role = (role_name[:15] + '..') if len(role_name) > 15 else role_name
+    title = f"{timestamp} - {short_role}"
+    
+    # Sort
+    df = df.sort_values(by='AI Score', ascending=False)
+    
+    # Create new tab
+    ws = sh.add_worksheet(title=title, rows=20, cols=10)
+    ws.append_row(['AI Score', 'Name', 'Reason', 'Link'])
+    ws.append_rows(df[['AI Score', 'Name', 'Reason', 'Link']].values.tolist())
+    
+    return f"{sh.url}#gid={ws.id}", title
 
 # --- AI & SEARCH FUNCTIONS ---
 
@@ -99,23 +98,6 @@ def search_google(queries):
         except: pass
     return results
 
-def save_results(sheet_key, df, role_name):
-    client = get_gspread_client()
-    # Open the User's specific sheet
-    sh = client.open_by_key(sheet_key)
-    timestamp = datetime.now().strftime("%m-%d %H:%M")
-    short_role = (role_name[:15] + '..') if len(role_name) > 15 else role_name
-    title = f"{timestamp} - {short_role}"
-    
-    # Sort
-    df = df.sort_values(by='AI Score', ascending=False)
-    
-    ws = sh.add_worksheet(title=title, rows=20, cols=10)
-    ws.append_row(['AI Score', 'Name', 'Reason', 'Link'])
-    ws.append_rows(df[['AI Score', 'Name', 'Reason', 'Link']].values.tolist())
-    
-    return f"{sh.url}#gid={ws.id}", title
-
 def send_email(email, df, url, role):
     msg = MIMEMultipart()
     msg['Subject'] = f"Results: {role}"
@@ -125,7 +107,7 @@ def send_email(email, df, url, role):
     html = df.head(5)[['AI Score', 'Name', 'Reason']].to_html(index=False)
     body = f"""
     <h3>AI Agent Results: {role}</h3>
-    <p><strong>📂 Your Database:</strong> <a href='{url}'>Click to Open Sheet</a></p>
+    <p><strong>📂 Database:</strong> <a href='{url}'>Click to Open Sheet</a></p>
     <hr>
     {html}
     """
@@ -143,42 +125,18 @@ with st.sidebar:
     model = st.radio("Model", ["gpt-4o", "gpt-4o-mini"])
 
 with st.form("main"):
-    # 1. Capture User Email
-    email = st.text_input("Your Email", "judd@sharphuman.com")
+    # Simplified Inputs: We know where the data is going!
+    email = st.text_input("Send Report To", "judd@sharphuman.com")
     
-    # 2. Check Memory for this Email
-    known_key = get_user_sheet_id(email) if email else None
-    
-    if known_key:
-        st.success(f"✅ Welcome back! Database loaded for {email}")
-        sheet_input = st.text_input("Database URL", value="[Hidden: Loaded from Memory]", disabled=True)
-    else:
-        st.info("👋 New User? We need a place to save your data.")
-        st.markdown(f"1. Create a Google Sheet. <br>2. Share it with: `{st.secrets['SHEET_CREDENTIALS']['client_email']}` (Editor)<br>3. Paste the URL below.", unsafe_allow_html=True)
-        sheet_input = st.text_input("Paste Your Google Sheet URL Here")
-
     c1, c2 = st.columns(2)
     with c1: loc = st.text_input("Location (Optional)")
     with c2: style = st.text_input("Work Style (Optional)")
+    
     jd = st.text_area("Job Description")
     
-    submitted = st.form_submit_button("Run")
+    submitted = st.form_submit_button("Run Agent")
 
 if submitted and jd:
-    # Determine the final Sheet Key to use
-    final_key = known_key
-    
-    if not final_key:
-        # If not in memory, extract ID from the pasted URL
-        try:
-            # Logic to rip the ID out of the long URL
-            final_key = sheet_input.split("/d/")[1].split("/")[0]
-            # Save it to memory so they don't have to paste it next time
-            save_user_memory(email, final_key)
-        except:
-            st.error("❌ Invalid Google Sheet URL. Please check the link.")
-            st.stop()
-
     status = st.status("Agent is working...", expanded=True)
     status.write("🧠 Building strategy...")
     
@@ -200,21 +158,21 @@ if submitted and jd:
                 scored.append(r)
             
             df = pd.DataFrame(scored)
-            df = df[df['AI Score'] > 10] # Filter low scores
+            df = df[df['AI Score'] > 10] 
             
-            status.write("💾 Saving to your Sheet...")
+            status.write("💾 Saving to Master Database...")
             
             try:
-                url, tab_name = save_results(final_key, df, strat['role_title'])
+                url, tab_name = save_results(df, strat['role_title'])
                 send_email(email, df, url, strat['role_title'])
                 
                 status.update(label="✅ Done!", state="complete", expanded=False)
                 st.success(f"Results saved to tab: {tab_name}")
-                st.markdown(f"**[Open Your Sheet]({url})**")
+                st.markdown(f"**[Open Database]({url})**")
                 st.dataframe(df[['AI Score', 'Name', 'Reason']].head())
                 
             except Exception as e:
                 status.update(label="❌ Error", state="error")
-                st.error(f"Could not save to sheet. Did you share it with the bot? Error: {e}")
+                st.error(f"Error saving data: {e}")
         else:
             st.warning("No results found.")
