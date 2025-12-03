@@ -57,6 +57,7 @@ def save_results(df, role_name):
 # --- AI & SEARCH FUNCTIONS ---
 
 def generate_search_strategy(jd_text, location, work_style, model_choice):
+    # NOTE: I relaxed the prompt here to be less strict about location if "Remote" is chosen
     prompt = f"JOB: {jd_text[:3000]} | LOC: {location} | STYLE: {work_style}. Gen 3 Boolean strings. Output JSON: 'role_title', 'boolean_strings'."
     try:
         res = client_ai.chat.completions.create(model=model_choice, response_format={"type": "json_object"}, messages=[{"role": "user", "content": prompt}])
@@ -110,7 +111,7 @@ with st.sidebar:
 with st.form("main"):
     email = st.text_input("Send Report To", "judd@sharphuman.com")
     c1, c2 = st.columns(2)
-    with c1: loc = st.text_input("Location")
+    with c1: loc = st.text_input("Location (Try leaving blank if Remote)")
     with c2: style = st.text_input("Work Style")
     jd = st.text_area("Job Description")
     submitted = st.form_submit_button("Run Agent")
@@ -143,14 +144,20 @@ if submitted and jd:
             st.success(f"Saved to: {tab}")
             st.markdown(f"**[Open Database]({url})**")
             
-            # --- FIX FOR "FULL LINK OR NAME" ---
-            # This makes the Link column a clickable button so it's not cut off
+            # --- THE VISUAL FIX ---
+            # This forces the "Link" to be a button and "Name" to be wider
             st.dataframe(
                 df[['AI Score', 'Name', 'Reason', 'Link']],
                 column_config={
-                    "Link": st.column_config.LinkColumn("Profile Link"),
+                    "Name": st.column_config.TextColumn("Candidate Name", width="medium"),
+                    "Reason": st.column_config.TextColumn("AI Analysis", width="large"),
+                    "Link": st.column_config.LinkColumn(
+                        "Link",
+                        display_text="Open Profile" # Replaces long URL with neat text
+                    ),
                 },
-                hide_index=True
+                hide_index=True,
+                use_container_width=True
             )
         else:
-            st.warning("No results.")
+            st.warning("No results found. Try clearing the 'Location' field if searching for Remote roles.")
