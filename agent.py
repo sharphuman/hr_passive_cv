@@ -18,7 +18,7 @@ GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
 SHEET_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# The specific sheet you want to use
+# THE MASTER SHEET ID
 MASTER_SHEET_ID = "14x4FW2Zsbj9g-j5bGt12l5SsK11fWEf94i0t1HxAnas"
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
@@ -26,34 +26,26 @@ client_ai = OpenAI(api_key=OPENAI_API_KEY)
 # --- GOOGLE SHEETS FUNCTIONS ---
 
 def get_gspread_client():
-    """Authenticates with Google Sheets."""
     creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SHEET_SCOPE)
     return gspread.authorize(creds)
 
 def save_results(df, role_name):
-    """
-    Saves directly to the hardcoded MASTER_SHEET_ID.
-    """
     client = get_gspread_client()
     try:
         sh = client.open_by_key(MASTER_SHEET_ID)
     except Exception as e:
-        st.error(f"❌ Permission Error: The bot cannot access your sheet. Please share '{MASTER_SHEET_ID}' with {st.secrets['SHEET_CREDENTIALS']['client_email']} as Editor.")
+        st.error(f"❌ Permission Error: Please share your sheet with: {st.secrets['SHEET_CREDENTIALS']['client_email']}")
         st.stop()
 
     timestamp = datetime.now().strftime("%m-%d %H:%M")
     short_role = (role_name[:15] + '..') if len(role_name) > 15 else role_name
     title = f"{timestamp} - {short_role}"
     
-    # Sort Candidates
-    df = df.sort_values(by='AI Score', ascending=False)
-    
-    # Create new tab for this search
+    # Create new tab
     try:
         ws = sh.add_worksheet(title=title, rows=20, cols=10)
-    except Exception as e:
-        # If tab name exists, append a random number
+    except:
         title = f"{title} ({datetime.now().second})"
         ws = sh.add_worksheet(title=title, rows=20, cols=10)
 
@@ -65,29 +57,17 @@ def save_results(df, role_name):
 # --- AI & SEARCH FUNCTIONS ---
 
 def generate_search_strategy(jd_text, location, work_style, model_choice):
-    prompt = f"""
-    JOB: {jd_text[:3000]} | LOC: {location} | STYLE: {work_style}
-    Generate 3 Boolean strings (LinkedIn, Niche, Resume). Output JSON keys: 'role_title', 'boolean_strings'.
-    """
+    prompt = f"JOB: {jd_text[:3000]} | LOC: {location} | STYLE: {work_style}. Gen 3 Boolean strings. Output JSON: 'role_title', 'boolean_strings'."
     try:
-        response = client_ai.chat.completions.create(
-            model=model_choice, response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return json.loads(response.choices[0].message.content)
+        res = client_ai.chat.completions.create(model=model_choice, response_format={"type": "json_object"}, messages=[{"role": "user", "content": prompt}])
+        return json.loads(res.choices[0].message.content)
     except: return None
 
 def ai_score_candidate(snippet, role, loc, style, model):
-    prompt = f"""
-    ROLE: {role} | LOC: {loc} | STYLE: {style} | CANDIDATE: {snippet}
-    Score 0-100. Check for role mismatch. Output JSON keys: 'score', 'reason', 'flag'.
-    """
+    prompt = f"ROLE: {role} | LOC: {loc} | STYLE: {style} | CANDIDATE: {snippet}. Score 0-100. Output JSON: 'score', 'reason', 'flag'."
     try:
-        response = client_ai.chat.completions.create(
-            model=model, response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return json.loads(response.choices[0].message.content)
+        res = client_ai.chat.completions.create(model=model, response_format={"type": "json_object"}, messages=[{"role": "user", "content": prompt}])
+        return json.loads(res.choices[0].message.content)
     except: return {"score": 0, "reason": "Error", "flag": "Unknown"}
 
 def search_google(queries):
@@ -97,10 +77,7 @@ def search_google(queries):
         try:
             res = service.cse().list(q=q, cx=SEARCH_ENGINE_ID, num=10).execute()
             for item in res.get('items', []):
-                title_parts = item['title'].split("-")
-                name = title_parts[0].strip() if len(title_parts) > 0 else "Unknown"
-                if not any(d['Link'] == item['link'] for d in results):
-                    results.append({'Name': name, 'Link': item['link'], 'Snippet': item['snippet']})
+                results.append({'Name': item['title'], 'Link': item['link'], 'Snippet': item['snippet']})
         except: pass
     return results
 
@@ -131,54 +108,49 @@ with st.sidebar:
     model = st.radio("Model", ["gpt-4o", "gpt-4o-mini"])
 
 with st.form("main"):
-    # Simplified Inputs
     email = st.text_input("Send Report To", "judd@sharphuman.com")
-    
     c1, c2 = st.columns(2)
-    with c1: loc = st.text_input("Location (Optional)")
-    with c2: style = st.text_input("Work Style (Optional)")
-    
+    with c1: loc = st.text_input("Location")
+    with c2: style = st.text_input("Work Style")
     jd = st.text_area("Job Description")
-    
     submitted = st.form_submit_button("Run Agent")
 
 if submitted and jd:
     status = st.status("Agent is working...", expanded=True)
-    status.write("🧠 Building strategy...")
-    
+    status.write("🧠 Strategy...")
     strat = generate_search_strategy(jd, loc, style, model)
+    
     if strat:
-        status.write(f"🔎 Role: {strat['role_title']}")
+        status.write(f"🔎 {strat['role_title']}")
         res = search_google(strat['boolean_strings'])
-        
         if res:
-            status.write(f"👀 Scoring {len(res)} profiles...")
+            status.write("👀 Scoring...")
             scored = []
-            progress_bar = status.progress(0)
-            
-            for i, r in enumerate(res):
-                progress_bar.progress((i + 1) / len(res))
+            for r in res:
                 s = ai_score_candidate(r['Snippet'], strat['role_title'], loc, style, model)
                 r['AI Score'] = s.get('score', 0)
                 r['Reason'] = s.get('reason', '')
                 scored.append(r)
             
             df = pd.DataFrame(scored)
-            df = df[df['AI Score'] > 10] 
+            df = df[df['AI Score'] > 10].sort_values(by='AI Score', ascending=False)
             
-            status.write("💾 Saving to Master Database...")
+            status.write("💾 Saving...")
+            url, tab = save_results(df, strat['role_title'])
+            send_email(email, df, url, strat['role_title'])
             
-            try:
-                url, tab_name = save_results(df, strat['role_title'])
-                send_email(email, df, url, strat['role_title'])
-                
-                status.update(label="✅ Done!", state="complete", expanded=False)
-                st.success(f"Results saved to tab: {tab_name}")
-                st.markdown(f"**[Open Database]({url})**")
-                st.dataframe(df[['AI Score', 'Name', 'Reason']].head())
-                
-            except Exception as e:
-                status.update(label="❌ Error", state="error")
-                st.error(f"Error saving data: {e}")
+            status.update(label="✅ Done!", state="complete")
+            st.success(f"Saved to: {tab}")
+            st.markdown(f"**[Open Database]({url})**")
+            
+            # --- FIX FOR "FULL LINK OR NAME" ---
+            # This makes the Link column a clickable button so it's not cut off
+            st.dataframe(
+                df[['AI Score', 'Name', 'Reason', 'Link']],
+                column_config={
+                    "Link": st.column_config.LinkColumn("Profile Link"),
+                },
+                hide_index=True
+            )
         else:
-            st.warning("No results found.")
+            st.warning("No results.")
