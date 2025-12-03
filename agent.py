@@ -11,71 +11,145 @@ from openai import OpenAI
 import json
 
 # --- CONFIGURATION ---
-# Load all secrets
 GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 SEARCH_ENGINE_ID = st.secrets["SEARCH_ENGINE_ID"]
 GMAIL_USER = st.secrets["GMAIL_USER"]
 GMAIL_APP_PASSWORD = st.secrets["GMAIL_APP_PASSWORD"]
 OPENAI_API_KEY = st.secrets["OPENAI_API_KEY"]
+DRIVE_FOLDER_ID = st.secrets["DRIVE_FOLDER_ID"]
 SHEET_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# Initialize OpenAI Client
+# Initialize OpenAI
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- AI AGENT FUNCTIONS ---
+# --- DATABASE MANAGEMENT FUNCTIONS (THE NEW PART) ---
 
-def generate_search_strategy(jd_text):
+def get_gspread_client():
+    creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SHEET_SCOPE)
+    return gspread.authorize(creds)
+
+def get_or_create_user_db(user_email):
     """
-    Uses GPT-4o to analyze the JD and create 3 distinct boolean search strings.
+    Checks the 'User_Registry' to see if this user already has a DB.
+    If not, creates a NEW file in the Shared Drive and registers it.
     """
-    prompt = f"""
-    You are an expert Technical Recruiter / Boolean Search Sourcer. 
-    Analyze this Job Description and generate 3 distinct Google X-Ray Boolean strings to find passive candidates.
+    client = get_gspread_client()
     
-    1. A broad LinkedIn search (site:linkedin.com/in/) focusing on title and key skills.
-    2. A niche platform search (site:github.com OR site:stackoverflow.com OR site:behance.net) relevant to the role type.
-    3. A 'Resume/CV' file search (filetype:pdf OR filetype:doc) for uploaded resumes.
-    
-    JOB DESCRIPTION:
-    {jd_text[:2000]}
-    
-    Output strictly valid JSON with keys: 'role_title', 'boolean_strings' (a list of 3 strings).
-    """
-    
+    # 1. Connect to the Registry Sheet
+    # We look for a file named "User_Registry" inside the specific folder
     try:
-        response = client_ai.chat.completions.create(
-            model="gpt-4o",
-            response_format={"type": "json_object"},
-            messages=[{"role": "system", "content": "You are a helpful sourcing assistant. Output JSON."},
-                      {"role": "user", "content": prompt}]
-        )
-        data = json.loads(response.choices[0].message.content)
-        return data
+        # Note: Ideally, pass the Registry ID directly in secrets for speed, 
+        # but searching by name works if it's unique in that folder.
+        registry_file = client.open("User_Registry")
+        registry_sheet = registry_file.sheet1
     except Exception as e:
-        st.error(f"AI Strategy Error: {e}")
+        st.error(f"Critical Error: Could not find 'User_Registry' sheet in the folder. Please create it first. ({e})")
         return None
 
-def ai_score_candidate(candidate_snippet, jd_summary):
-    """
-    Uses GPT-4o-mini (Cheaper/Faster) to score a single candidate snippet against the JD.
-    """
+    # 2. Check if user exists
+    records = registry_sheet.get_all_records()
+    user_map = {row['User Email']: row for row in records}
+    
+    if user_email in user_map:
+        # User Found! Return their existing Sheet
+        sheet_id = user_map[user_email]['Sheet ID']
+        try:
+            return client.open_by_key(sheet_id)
+        except:
+            st.warning("Found your ID in registry, but couldn't open the file. Creating a new one...")
+    
+    # 3. User Not Found (or broken) -> Create New One
+    st.info(f"🆕 First time for {user_email}? Setting up your private database...")
+    
+    # We use the Drive API directly to create a file INSIDE the Shared Drive Folder
+    # This bypasses the Service Account "0GB Quota" issue (because the Shared Drive owns it)
+    drive_service = build('drive', 'v3', developerKey=GOOGLE_API_KEY, credentials=client.auth)
+    
+    file_metadata = {
+        'name': f"Candidate DB - {user_email}",
+        'parents': [DRIVE_FOLDER_ID], # Puts it in the Shared Drive
+        'mimeType': 'application/vnd.google-apps.spreadsheet'
+    }
+    
+    file = drive_service.files().create(body=file_metadata, fields='id, webViewLink').execute()
+    new_sheet_id = file.get('id')
+    new_sheet_url = file.get('webViewLink')
+    
+    # 4. Share it with the User
+    # We grant them "Writer" access so they own their data
+    try:
+        batch = drive_service.permissions().create(
+            fileId=new_sheet_id,
+            body={'type': 'user', 'role': 'writer', 'emailAddress': user_email},
+            fields='id',
+        ).execute()
+    except Exception as e:
+        st.warning(f"Created DB but failed to share: {e}")
+
+    # 5. Initialize the new sheet with headers
+    new_sh = client.open_by_key(new_sheet_id)
+    # (Optional: Setup a 'Master' tab if you want)
+
+    # 6. Register the new user
+    registry_sheet.append_row([user_email, new_sheet_id, new_sheet_url])
+    
+    return new_sh
+
+# --- AI & SEARCH FUNCTIONS (SAME AS BEFORE) ---
+
+def generate_search_strategy(jd_text, location, work_style, model_choice):
     prompt = f"""
-    You are a Hiring Manager. 
-    Evaluate this candidate snippet against the role requirements.
+    You are an expert Sourcer. Create a search strategy.
+    
+    JOB CONTEXT:
+    - Role Description: {jd_text[:3000]}
+    - Target Location: {location}
+    - Work Style: {work_style}
+    
+    TASK:
+    Generate 3 distinct Google X-Ray Boolean strings.
+    1. LinkedIn: Include location keywords if 'Onsite' or 'Hybrid'.
+    2. Niche (GitHub/StackOverflow): Targeted at domain + Location.
+    3. Resume File Search: Uploaded CVs.
+    
+    Output JSON with keys: 'role_title', 'boolean_strings' (list of 3).
+    """
+    try:
+        response = client_ai.chat.completions.create(
+            model=model_choice,
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": "Output valid JSON only."},
+                      {"role": "user", "content": prompt}]
+        )
+        return json.loads(response.choices[0].message.content)
+    except Exception as e:
+        st.error(f"Strategy Error: {e}")
+        return None
+
+def ai_score_candidate(candidate_snippet, jd_summary, location, work_style, model_choice):
+    prompt = f"""
+    You are a Hiring Manager. Evaluate this candidate snippet.
     
     ROLE: {jd_summary}
-    CANDIDATE SNIPPET: {candidate_snippet}
+    REQ LOCATION: {location}
+    REQ WORK STYLE: {work_style}
+    SNIPPET: {candidate_snippet}
+    
+    RULES:
+    1. Role Mismatch: If Role is Engineer and candidate is Recruiter, SCORE 0.
+    2. Location: If Onsite/Hybrid, strictly penalize mismatch.
     
     Output JSON:
     {{
         "score": (integer 0-100),
-        "reason": (1 short sentence explaining the match or mismatch),
-        "flag": (string: "Remote", "Senior", "Junior", or "Unknown")
+        "reason": (1 short sentence),
+        "flag": (string: "Strong Match", "Location Mismatch", "Role Mismatch", "Too Senior/Junior")
     }}
     """
     try:
         response = client_ai.chat.completions.create(
-            model="gpt-4o-mini", # Using mini for speed/cost on loops
+            model=model_choice,
             response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}]
         )
@@ -83,63 +157,40 @@ def ai_score_candidate(candidate_snippet, jd_summary):
     except:
         return {"score": 0, "reason": "AI Error", "flag": "Unknown"}
 
-# --- GOOGLE & SHEETS FUNCTIONS ---
-
-def get_sheet_connection():
-    creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SHEET_SCOPE)
-    return gspread.authorize(creds)
-
-def create_tab_and_fill(df, role_name, sheet_name):
-    try:
-        client = get_sheet_connection()
-        sh = client.open(sheet_name)
-        
-        timestamp = datetime.now().strftime("%m-%d %H:%M")
-        short_role = (role_name[:15] + '..') if len(role_name) > 15 else role_name
-        tab_title = f"{timestamp} - {short_role}"
-        
-        # Sort by Score (High to Low)
-        df = df.sort_values(by='AI Score', ascending=False)
-        
-        worksheet = sh.add_worksheet(title=tab_title, rows=30, cols=10)
-        worksheet.append_row(['AI Score', 'Name', 'Reason', 'Flag', 'Link', 'Snippet'])
-        
-        # Select specific columns
-        data = df[['AI Score', 'Name', 'Reason', 'Flag', 'Link', 'Snippet']].values.tolist()
-        worksheet.append_rows(data)
-        
-        return True, f"{sh.url}#gid={worksheet.id}", tab_title
-    except Exception as e:
-        st.error(f"Tab Creation Error: {e}")
-        return False, None, None
-
 def search_google(queries):
     service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
     all_results = []
-    
     for q in queries:
         try:
-            # We fetch 10 results per query string (Total 30 potential)
             res = service.cse().list(q=q, cx=SEARCH_ENGINE_ID, num=10).execute()
             for item in res.get('items', []):
                 title_parts = item['title'].split("-")
                 name = title_parts[0].strip() if len(title_parts) > 0 else "Unknown"
-                
-                # Deduplicate by link
                 if not any(d['Link'] == item['link'] for d in all_results):
-                    all_results.append({
-                        'Name': name,
-                        'Link': item['link'],
-                        'Snippet': item['snippet']
-                    })
-        except Exception as e:
-            st.write(f"Search warning for query '{q}': {e}")
-            
+                    all_results.append({'Name': name, 'Link': item['link'], 'Snippet': item['snippet']})
+        except: pass
     return all_results
 
-def send_summary_email(user_email, df, sheet_url, role_name):
-    # Filter top 5 for the email body
+def create_tab_and_fill(user_sheet, df, role_name):
+    try:
+        timestamp = datetime.now().strftime("%m-%d %H:%M")
+        short_role = (role_name[:15] + '..') if len(role_name) > 15 else role_name
+        tab_title = f"{timestamp} - {short_role}"
+        
+        df = df.sort_values(by='AI Score', ascending=False)
+        
+        worksheet = user_sheet.add_worksheet(title=tab_title, rows=30, cols=10)
+        worksheet.append_row(['AI Score', 'Name', 'Location/Flag', 'Reason', 'Link', 'Snippet'])
+        
+        data = df[['AI Score', 'Name', 'Flag', 'Reason', 'Link', 'Snippet']].values.tolist()
+        worksheet.append_rows(data)
+        
+        return True, f"{user_sheet.url}#gid={worksheet.id}", tab_title
+    except Exception as e:
+        st.error(f"Tab Creation Error: {e}")
+        return False, None, None
+
+def send_summary_email(user_email, df, sheet_url, role_name, model_used):
     top_candidates = df.sort_values(by='AI Score', ascending=False).head(5)
     
     msg = MIMEMultipart()
@@ -147,17 +198,16 @@ def send_summary_email(user_email, df, sheet_url, role_name):
     msg['From'] = GMAIL_USER
     msg['To'] = user_email
 
-    html_table = top_candidates[['AI Score', 'Name', 'Reason', 'Link']].to_html(index=False, border=0, justify="left")
+    html_table = top_candidates[['AI Score', 'Name', 'Reason']].to_html(index=False, border=0, justify="left")
     
     body = f"""
     <h3>Talent Agent Report</h3>
-    <p>I analyzed the web for <strong>{role_name}</strong>.</p>
-    <p><strong>📂 Full Analysis (All Candidates):</strong> <a href="{sheet_url}">Open Google Sheet</a></p>
+    <p><strong>Role:</strong> {role_name}</p>
+    <p><strong>AI Model:</strong> {model_used}</p>
+    <p><strong>📂 Your Private Database:</strong> <a href="{sheet_url}">Open Google Sheet</a></p>
     
-    <h4>Top 5 AI-Ranked Matches:</h4>
+    <h4>Top 5 Matches:</h4>
     {html_table}
-    <br>
-    <p><i>Scores generated by GPT-4o based on Job Description analysis.</i></p>
     """
     msg.attach(MIMEText(body, 'html'))
 
@@ -171,71 +221,83 @@ def send_summary_email(user_email, df, sheet_url, role_name):
         return False
 
 # --- MAIN APP UI ---
-st.set_page_config(page_title="AI Talent Agent", page_icon="🤖")
+st.set_page_config(page_title="AI Talent Agent", page_icon="🤖", layout="wide")
+
+with st.sidebar:
+    st.header("⚙️ Settings")
+    model_option = st.radio("AI Brain:", ["gpt-4o", "gpt-4o-mini"], index=0)
+
 st.title("🤖 AI Talent Agent")
-st.markdown("Paste a Job Description. I will design the search, find candidates across the web, and score them for you.")
+st.markdown("Automated sourcing with your own private database.")
 
 with st.form("agent_form"):
-    # Input is now a big text area for the JD
+    c1, c2 = st.columns(2)
+    with c1:
+        # This email is now the KEY to their database
+        recipient_email = st.text_input("Your Email (Google Account)", "judd@sharphuman.com")
+    with c2:
+        # We don't need Sheet Name input anymore! The bot manages it.
+        st.info("ℹ️ We will automatically load (or create) your personal candidate database.")
+    
+    c3, c4 = st.columns(2)
+    with c3:
+        loc_input = st.text_input("📍 Location", placeholder="e.g. Nashville, USA")
+    with c4:
+        style_input = st.text_input("🏢 Work Style", placeholder="e.g. Remote, Hybrid")
+
     jd_input = st.text_area("Paste Job Description Here", height=200)
-    recipient_email = st.text_input("Email Report To", "judd@sharphuman.com")
-    master_sheet_name = st.text_input("Master Sheet Name", "Candidate Database")
     
     submitted = st.form_submit_button("Launch Agent")
 
 if submitted and jd_input:
-    status = st.status("Agent is working...", expanded=True)
+    status = st.status("Agent is starting...", expanded=True)
     
-    # 1. AI Strategy
-    status.write("🧠 Reading JD and generating search strategy...")
-    strategy = generate_search_strategy(jd_input)
+    # 1. SETUP DB
+    status.write(f"📂 Accessing database for **{recipient_email}**...")
+    user_sheet = get_or_create_user_db(recipient_email)
     
-    if strategy:
-        role_title = strategy.get('role_title', 'Candidate Search')
-        queries = strategy.get('boolean_strings', [])
+    if user_sheet:
+        status.write(f"🧠 Analyzing JD with **{model_option}**...")
+        strategy = generate_search_strategy(jd_input, loc_input, style_input, model_option)
         
-        status.write(f"🔎 Identified Role: **{role_title}**")
-        status.write(f"🌐 Running {len(queries)} unique boolean searches across the web...")
-        
-        # 2. Search Google
-        raw_candidates = search_google(queries)
-        status.write(f"👀 Found {len(raw_candidates)} raw profiles. Now reading and scoring...")
-        
-        # 3. AI Scoring Loop
-        scored_data = []
-        progress_bar = status.progress(0)
-        
-        for i, cand in enumerate(raw_candidates):
-            # Update progress
-            progress_bar.progress((i + 1) / len(raw_candidates))
+        if strategy:
+            role_title = strategy.get('role_title', 'Candidate Search')
+            queries = strategy.get('boolean_strings', [])
             
-            # AI Scoring
-            ai_result = ai_score_candidate(cand['Snippet'], role_title)
+            status.write(f"🔎 Role: **{role_title}**")
+            status.write(f"🌐 Running {len(queries)} searches...")
             
-            cand['AI Score'] = ai_result.get('score', 0)
-            cand['Reason'] = ai_result.get('reason', 'N/A')
-            cand['Flag'] = ai_result.get('flag', '')
-            scored_data.append(cand)
+            raw_candidates = search_google(queries)
             
-        df = pd.DataFrame(scored_data)
-        
-        # Filter out bad matches (below 40%) to keep list clean
-        df = df[df['AI Score'] > 40]
-        
-        status.write("💾 Saving Top Candidates to Google Drive...")
-        
-        # 4. Save & Email
-        success, tab_url, tab_name = create_tab_and_fill(df, role_title, master_sheet_name)
-        
-        if success:
-            send_summary_email(recipient_email, df, tab_url, role_title)
-            status.update(label="✅ Mission Complete!", state="complete", expanded=False)
-            
-            st.success(f"Report generated for {role_title}!")
-            st.markdown(f"**[View Google Sheet Results]({tab_url})**")
-            st.dataframe(df[['AI Score', 'Name', 'Reason', 'Link']].head(10))
-            
-        else:
-            status.update(label="❌ Error Saving Data", state="error")
+            if raw_candidates:
+                status.write(f"👀 Scoring {len(raw_candidates)} profiles...")
+                
+                scored_data = []
+                progress_bar = status.progress(0)
+                
+                for i, cand in enumerate(raw_candidates):
+                    progress_bar.progress((i + 1) / len(raw_candidates))
+                    ai_result = ai_score_candidate(cand['Snippet'], role_title, loc_input, style_input, model_option)
+                    cand['AI Score'] = ai_result.get('score', 0)
+                    cand['Reason'] = ai_result.get('reason', 'N/A')
+                    cand['Flag'] = ai_result.get('flag', '')
+                    scored_data.append(cand)
+                    
+                df = pd.DataFrame(scored_data)
+                df = df[df['AI Score'] > 10]
+                
+                status.write("💾 Saving to your Private Sheet...")
+                success, tab_url, tab_name = create_tab_and_fill(user_sheet, df, role_title)
+                
+                if success:
+                    send_summary_email(recipient_email, df, tab_url, role_title, model_option)
+                    status.update(label="✅ Success!", state="complete", expanded=False)
+                    st.success(f"Report sent to {recipient_email}")
+                    st.markdown(f"**[Open Your Database]({tab_url})**")
+                    st.dataframe(df[['AI Score', 'Name', 'Reason']].head(5))
+                else:
+                    st.error("Error saving to sheet.")
+            else:
+                st.warning("No candidates found.")
     else:
-        st.error("Could not parse JD. Please try again.")
+        st.error("Could not setup database. Check Shared Drive permissions.")
