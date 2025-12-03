@@ -20,7 +20,7 @@ SHEET_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.
 
 client_ai = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- MEMORY SYSTEM FUNCTIONS ---
+# --- MEMORY SYSTEM (THE PHONEBOOK) ---
 
 def get_gspread_client():
     creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
@@ -42,8 +42,7 @@ def get_user_sheet_id(user_email):
             if row['User'].strip().lower() == user_email.strip().lower():
                 return row['Sheet_Key']
     except Exception as e:
-        # If Bot_Memory fails, we can't look up, but we can still ask user for URL manually
-        print(f"Memory Lookup Error: {e}")
+        print(f"Memory Lookup Error (Check if 'Bot_Memory' exists): {e}")
         return None
     return None
 
@@ -56,7 +55,7 @@ def save_user_memory(user_email, sheet_key):
         memory = client.open("Bot_Memory").sheet1
         memory.append_row([user_email, sheet_key])
     except Exception as e:
-        st.warning(f"Could not save to memory (Check if 'Bot_Memory' exists and is shared): {e}")
+        st.warning(f"Could not save to memory. Ensure 'Bot_Memory' exists and is shared with the bot. Error: {e}")
 
 # --- AI & SEARCH FUNCTIONS ---
 
@@ -95,7 +94,7 @@ def search_google(queries):
             for item in res.get('items', []):
                 title_parts = item['title'].split("-")
                 name = title_parts[0].strip() if len(title_parts) > 0 else "Unknown"
-                if not any(d['Link'] == item['link'] for d in all_results):
+                if not any(d['Link'] == item['link'] for d in results):
                     results.append({'Name': name, 'Link': item['link'], 'Snippet': item['snippet']})
         except: pass
     return results
