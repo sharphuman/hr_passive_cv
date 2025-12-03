@@ -11,7 +11,7 @@ from openai import OpenAI
 import json
 
 # --- CONFIGURATION ---
-# We use .get() to avoid crashing if a secret is missing
+# We use .get() to avoid crashing
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
 SEARCH_ENGINE_ID = st.secrets.get("SEARCH_ENGINE_ID")
 GMAIL_USER = st.secrets.get("GMAIL_USER")
@@ -19,7 +19,7 @@ GMAIL_APP_PASSWORD = st.secrets.get("GMAIL_APP_PASSWORD")
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY")
 
 SHEET_SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-# Your specific Master Sheet
+# Your Master Sheet ID
 MASTER_SHEET_ID = "14x4FW2Zsbj9g-j5bGt12l5SsK11fWEf94i0t1HxAnas"
 
 if OPENAI_API_KEY:
@@ -29,38 +29,32 @@ if OPENAI_API_KEY:
 
 def get_gspread_client():
     if "SHEET_CREDENTIALS" not in st.secrets:
-        st.error("⚠️ Missing Sheet Credentials in Secrets.")
+        st.error("⚠️ Missing Sheet Credentials.")
         st.stop()
     creds_dict = dict(st.secrets["SHEET_CREDENTIALS"])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, SHEET_SCOPE)
     return gspread.authorize(creds)
 
 def generate_search_strategy(jd_text, location, work_style, model_choice):
-    # --- LOGIC FIX FOR "0 RESULTS" ---
-    # If "Remote" is mentioned, we relax the location constraint in the search query.
-    # We still keep it in the prompt so the AI can SCORE them lower if they aren't in the right country,
-    # but we don't force it in the Google Search string.
+    # STRATEGY UPDATE: We force the AI to produce strictly LinkedIn Profile searches
+    # We ask for synonyms to catch more people (e.g. "M365" OR "Microsoft 365")
     
+    loc_prompt = f"AND \"{location}\"" if location.strip() else ""
+    if "remote" in work_style.lower():
+        loc_prompt = "" # Ignore city if remote
+
     prompt = f"""
-    You are an expert Technical Sourcer. Create 3 Google X-Ray Boolean Strings.
+    You are an expert Sourcer. Create 3 "X-Ray" Boolean strings to find candidates on LinkedIn.
     
-    JOB DESCRIPTION: {jd_text[:3000]}
-    TARGET LOCATION: {location}
-    WORK STYLE: {work_style}
+    JOB: {jd_text[:2000]}
     
-    IMPORTANT STRATEGY:
-    1. If WORK STYLE is "Remote", do NOT hardcode a specific city (like "Nashville") into the boolean string unless strictly necessary. Use broader terms like "USA" or just "Remote".
-    2. If WORK STYLE is "Onsite", YOU MUST include the city in the boolean string.
+    RULES:
+    1. BASE: All queries MUST start with: site:linkedin.com/in/
+    2. TITLES: Use OR for title variations. Example: ("M365 Admin" OR "Microsoft 365 Administrator" OR "SharePoint Admin")
+    3. LOCATION: {loc_prompt} (Only include if provided)
+    4. NO JUNK: Do not include "intitle:resume" or "filetype:pdf". Stick to profiles.
     
-    OUTPUT JSON:
-    {{
-        "role_title": "Short Role Name",
-        "boolean_strings": [
-            "site:linkedin.com/in/ ...",
-            "site:github.com ...",
-            "filetype:pdf ..."
-        ]
-    }}
+    Output JSON with keys: 'role_title', 'boolean_strings' (list of 3 strings).
     """
     try:
         response = client_ai.chat.completions.create(
@@ -83,26 +77,35 @@ def search_google(queries):
     
     for q in queries:
         try:
-            # We wrap this in try/except because sometimes complex queries fail
+            # We explicitly print the query to the UI so you can see what is happening
+            print(f"Running Query: {q}") 
+            
             res = service.cse().list(q=q, cx=SEARCH_ENGINE_ID, num=10).execute()
             for item in res.get('items', []):
-                results.append({
-                    'Name': item['title'].split("-")[0].strip(),
-                    'Link': item['link'],
-                    'Snippet': item['snippet']
-                })
+                link = item['link']
+                
+                # FILTER: STRICTLY LINKEDIN PROFILES ONLY
+                # This removes the "login", "job posting", and "company page" junk
+                if "linkedin.com/in/" in link:
+                    results.append({
+                        'Name': item['title'].split("-")[0].strip(),
+                        'Link': link,
+                        'Snippet': item['snippet']
+                    })
         except Exception:
             continue
     return results
 
 def ai_score_candidate(snippet, role, loc, style, model):
     prompt = f"""
-    Evaluate Candidate.
-    ROLE: {role} | REQ LOC: {loc} | REQ STYLE: {style}
-    CANDIDATE SNIPPET: {snippet}
+    Role: {role} | Loc: {loc} | Style: {style}
+    Candidate Snippet: {snippet}
     
-    Score 0-100.
-    Output JSON: "score" (int), "reason" (string).
+    Task: Score 0-100.
+    - If snippet looks like a Job Posting or Recruiter, Score 0.
+    - If snippet matches skills, Score high.
+    
+    Output JSON: 'score' (int), 'reason' (string).
     """
     try:
         response = client_ai.chat.completions.create(
@@ -118,7 +121,7 @@ def save_results(df, role_name):
     try:
         sh = client.open_by_key(MASTER_SHEET_ID)
     except:
-        st.error(f"❌ Permission Error. Share Sheet {MASTER_SHEET_ID} with the bot email.")
+        st.error("❌ Permission Error. Share the sheet with the bot email.")
         st.stop()
 
     timestamp = datetime.now().strftime("%m-%d %H:%M")
@@ -161,7 +164,7 @@ with st.sidebar:
 with st.form("main"):
     email = st.text_input("Send Report To", "judd@sharphuman.com")
     c1, c2 = st.columns(2)
-    with c1: loc = st.text_input("Location", placeholder="e.g. Nashville (Leave blank if Remote)")
+    with c1: loc = st.text_input("Location", placeholder="Leave blank for Remote/World")
     with c2: style = st.text_input("Work Style", value="Remote")
     jd = st.text_area("Job Description")
     
@@ -170,20 +173,34 @@ with st.form("main"):
 if submitted and jd:
     status = st.status("Agent is working...", expanded=True)
     
-    status.write("🧠 Building Strategy...")
+    status.write("🧠 Strategy...")
     strat = generate_search_strategy(jd, loc, style, model)
     
     if strat:
-        status.write(f"🔎 {strat['role_title']}")
-        res = search_google(strat['boolean_strings'])
+        role = strat['role_title']
+        queries = strat['boolean_strings']
+        status.write(f"🔎 Role: {role}")
         
+        # Show user the actual search logic (Debugging)
+        with st.expander("See Boolean Search Strings"):
+            st.write(queries)
+
+        res = search_google(queries)
+        
+        # --- AUTO-RETRY LOGIC ---
+        if len(res) == 0:
+            status.write("⚠️ 0 Results. Trying a broader search (Removing location constraint)...")
+            # Generate a broader strategy by force
+            broad_strat = generate_search_strategy(jd, "", "Remote", model) # Force broad
+            res = search_google(broad_strat['boolean_strings'])
+
         if res:
             status.write(f"👀 Scoring {len(res)} candidates...")
             scored = []
             progress = status.progress(0)
             for i, r in enumerate(res):
                 progress.progress((i+1)/len(res))
-                s = ai_score_candidate(r['Snippet'], strat['role_title'], loc, style, model)
+                s = ai_score_candidate(r['Snippet'], role, loc, style, model)
                 r['AI Score'] = s.get('score', 0)
                 r['Reason'] = s.get('reason', 'N/A')
                 scored.append(r)
@@ -191,23 +208,26 @@ if submitted and jd:
             df = pd.DataFrame(scored)
             df = df[df['AI Score'] > 10].sort_values(by='AI Score', ascending=False)
             
-            status.write("💾 Saving...")
-            url, tab = save_results(df, strat['role_title'])
-            send_email(email, df, url, strat['role_title'])
-            
-            status.update(label="✅ Done", state="complete")
-            st.success(f"Saved to: {tab}")
-            
-            # --- VISUAL FIX FOR CUT-OFF LINKS ---
-            st.dataframe(
-                df[['AI Score', 'Name', 'Reason', 'Link']],
-                column_config={
-                    "Link": st.column_config.LinkColumn("Profile", display_text="Open Link"),
-                    "Reason": st.column_config.TextColumn("Analysis", width="large")
-                },
-                hide_index=True,
-                use_container_width=True
-            )
+            if len(df) > 0:
+                status.write("💾 Saving...")
+                url, tab = save_results(df, role)
+                send_email(email, df, url, role)
+                
+                status.update(label="✅ Done", state="complete")
+                st.success(f"Saved to tab: {tab}")
+                
+                st.dataframe(
+                    df[['AI Score', 'Name', 'Reason', 'Link']],
+                    column_config={
+                        "Link": st.column_config.LinkColumn("Profile", display_text="Open Link"),
+                        "Reason": st.column_config.TextColumn("Analysis", width="large")
+                    },
+                    hide_index=True,
+                    use_container_width=True
+                )
+            else:
+                status.update(label="⚠️ Low Relevance", state="error")
+                st.warning("Found profiles, but none matched the JD high enough (Low AI Scores).")
         else:
             status.update(label="⚠️ No Results", state="error")
-            st.warning("Google returned 0 results. The AI might have been too strict with the location keywords.")
+            st.error("Google returned 0 results even after broadening the search.")
